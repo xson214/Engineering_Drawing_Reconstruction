@@ -1,0 +1,107 @@
+\documentclass[12pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T5]{fontenc} % Để hiển thị tiếng Việt chuẩn
+\usepackage[vietnamese]{babel}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{geometry}
+\usepackage{float}
+\usepackage{amsmath}
+
+\geometry{a4paper, margin=2.5cm}
+
+\title{\textbf{BÁO CÁO DỰ ÁN}\\ \Large{\textbf{AUTOMATED ENGINEERING DRAWING RECONSTRUCTION ENGINE}}}
+\author{}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+\tableofcontents
+\newpage
+
+\section{Giới thiệu (Introduction)}
+Số hóa tài liệu kỹ thuật (Engineering Drawings) đang là một bài toán đầy thách thức trong lĩnh vực thị giác máy tính (Computer Vision) và xử lý ngôn ngữ tự nhiên (NLP). Các bản vẽ kỹ thuật thường chứa sự kết hợp phức tạp giữa các đường nét đồ họa (CAD), bảng biểu không có viền rõ ràng, và các ghi chú (notes) viết chồng chéo. 
+
+Mục tiêu của dự án này là xây dựng một **Hệ thống tái tạo tài liệu (Reconstruction Engine)** tự động. Hệ thống nhận đầu vào là các hình ảnh bản vẽ kỹ thuật hoặc file PDF scan, sau đó phân tích bố cục, nhận diện các vùng ngữ nghĩa (Table, Note, Picture) và xuất ra định dạng JSON có cấu trúc cùng với một file Microsoft Word (\texttt{.docx}). Điểm khác biệt lớn nhất của dự án là khả năng tạo ra một file Word có layout giống hệt ảnh gốc (Pixel-Perfect Layout), giữ nguyên nền đồ họa kỹ thuật nhưng cho phép người dùng click vào chữ và bảng biểu để chỉnh sửa.
+
+\section{Cơ sở lý thuyết (Theoretical Background)}
+Dự án dựa trên sự kết hợp của ba bài toán cốt lõi:
+\begin{itemize}
+    \item \textbf{Document Layout Analysis (DLA):} Bài toán phân tích cấu trúc tài liệu, nhằm phát hiện và phân loại các khối thông tin trên ảnh (như Bảng, Đoạn văn, Tiêu đề, Hình ảnh).
+    \item \textbf{Table Structure Recognition (TSR):} Trích xuất cấu trúc ma trận của một bảng (số hàng, số cột, tọa độ của từng ô - cell) từ ảnh.
+    \item \textbf{Optical Character Recognition (OCR):} Trích xuất nội dung văn bản dạng chuỗi (text) từ các hình ảnh đã được phân vùng.
+\end{itemize}
+
+Về phần xuất bản tài liệu, dự án ứng dụng kiến thức sâu về chuẩn \textbf{OOXML (Office Open XML)} của Microsoft Word để sử dụng kỹ thuật "Định vị tuyệt đối" (Absolute Positioning), cho phép neo các phần tử văn bản vào các tọa độ cố định trên trang giấy bất chấp các cài đặt mặc định của Word.
+
+\section{Ý tưởng và Hướng tiếp cận (Approach)}
+Thay vì tiêu tốn tài nguyên vào việc tự huấn luyện (train) mô hình từ con số không, dự án này tập trung vào việc **xây dựng một Inference Pipeline thông minh và tối ưu**, tận dụng các file trọng số (pretrained weights) tốt nhất đang mã nguồn mở trên nền tảng \textbf{Hugging Face}.
+
+\textbf{Ý tưởng Rendering (Triết lý thiết kế DOCX):}
+\begin{itemize}
+    \item \textit{Không vector hóa bản vẽ:} Việc cố gắng OCR và biến đổi các bản vẽ cơ khí (Part Drawing) thành hình khối (Shape) là bất khả thi và sẽ làm phá vỡ cấu trúc. Do đó, hệ thống sẽ giữ nguyên bản vẽ dưới dạng ảnh nền (Background Image).
+    \item \textit{Masking \& Floating Text:} Tại các tọa độ mà mô hình phát hiện ra chữ (Text) hoặc bảng (Table), hệ thống sẽ vẽ các bảng nổi (Floating Tables) với màu nền trắng để "che" đi nét chữ cũ trên ảnh gốc, sau đó chèn chữ có thể chỉnh sửa (editable text) lên trên.
+\end{itemize}
+
+\section{Công nghệ sử dụng (Technologies)}
+Hệ thống được phát triển bằng Python với các công nghệ chính:
+\begin{enumerate}
+    \item \textbf{Mô hình Học sâu (Hugging Face Transformers):} Hệ thống sử dụng hai mô hình chuyên biệt được tinh chỉnh (fine-tuned) trên tập dữ liệu đặc thù:
+    \begin{itemize}
+        \item \textbf{Model 1 (Layout Detector):} Sử dụng kiến trúc \texttt{DetrForSegmentation} (Detection Transformer). Đây là mô hình chuyên trách phân tích bố cục vĩ mô, giúp khoanh vùng các cụm Table, Picture, Notes, Section-header trên toàn trang bản vẽ.
+        \item \textbf{Model 2 (Table Cell Detector):} Sử dụng kiến trúc \texttt{TableTransformerForObjectDetection} (TATR). Mô hình này chỉ kích hoạt trên các vùng ảnh "Table" đã cắt từ Model 1, chuyên trách việc nhận diện và bóc tách từng ô (Cell Bounding Boxes) bất chấp bảng có kẻ viền hay không.
+    \end{itemize}
+    \item \textbf{OCR Engine (Trích xuất văn bản):} Sử dụng thư viện \textbf{PaddleOCR} do khả năng nhận diện tiếng Việt (\textit{vi}) và tiếng Anh (\textit{en}) cực kỳ mạnh mẽ đối với font chữ kỹ thuật, số liệu nhỏ hoặc chữ bị xoay nghiêng. Tốc độ của PaddleOCR cũng được tối ưu tốt trên cả CPU và GPU.
+    \item \textbf{Xử lý hình ảnh và thuật toán phục dựng:} Dùng thuật toán Heuristic Clustering (Gom cụm tọa độ theo trục X/Y) bằng Python thuần để xây dựng lại lưới (Grid) của bảng từ các Cell rời rạc.
+    \item \textbf{Document Generation:} Sử dụng thư viện \texttt{python-docx} kết hợp can thiệp sâu vào thẻ XML (\texttt{w:tblpPr}, \texttt{w:tcW}, \texttt{w:trHeight}) để vẽ Layout chính xác tới từng pixel.
+    \item \textbf{Giao diện người dùng:} Xây dựng Web App tương tác nhanh bằng \texttt{Streamlit}.
+\end{enumerate}
+
+\section{Kiến trúc Pipeline (Pipeline Structure)}
+Luồng xử lý (Inference Pipeline) của dự án được thiết kế thành 4 giai đoạn nối tiếp nhau:
+
+\subsection{Stage 1: Region Detection}
+Ảnh đầu vào được đi qua Model 1. Mô hình dự đoán bounding box (bbox) và phân loại các semantic blocks. Sau đó, hệ thống sẽ crop (cắt) các vùng này ra thành các ảnh nhỏ lưu vào thư mục \texttt{cropped\_regions}.
+
+\subsection{Stage 2: Table Structure \& OCR}
+Các vùng được phân loại là "Table" sẽ tiếp tục được đưa qua Model 2 (Table Transformer) để crop ra từng ô (Cell) riêng biệt. Các ảnh cell và ảnh text (Notes) sau đó được đưa vào PaddleOCR để lấy nội dung văn bản.
+
+\subsection{Stage 3: Document Reconstruction Engine}
+Đây là bộ não của dự án:
+\begin{itemize}
+    \item \textbf{Region Grouping:} Gom các List-item hoặc Note gần nhau theo chiều dọc thành một đoạn văn hoàn chỉnh.
+    \item \textbf{Grid Recovery:} Từ tập hợp hàng chục Cell rời rạc, hệ thống tính toán trung điểm (Mid-point) giữa các cell kề nhau để tìm ra ranh giới cột (Column boundaries) và ranh giới hàng (Row boundaries), từ đó xác định chính xác chiều rộng từng cột (Column Width) và chiều cao từng hàng (Row Height).
+\end{itemize}
+Kết quả của bước này là một cấu trúc JSON chi tiết.
+
+\subsection{Stage 4: Pixel-Perfect Rendering}
+Hệ thống sử dụng kích thước ảnh để cấu hình kích thước trang giấy Word, cài đặt tất cả margin về 0. Đưa ảnh gốc vào làm ảnh nền ở một bảng vô hình góc $(0,0)$. Cuối cùng, đặt các Bảng (Table) và Ghi chú (TextBox) đè lên đúng tọa độ tuyệt đối mà model đã dự đoán.
+
+\section{Kết quả thực nghiệm (Implementation Results)}
+Kết quả đầu ra của hệ thống được lưu trữ tập trung tại thư mục \texttt{outputs/ocr\_results/}, bao gồm các tệp dữ liệu sau:
+\begin{itemize}
+    \item \texttt{all\_ocr\_results.json}: Lưu trữ kết quả văn bản thô (raw text) được trích xuất từ OCR.
+    \item \texttt{*\_structured.json}: Cấu trúc layout 2D và ma trận bảng đã được khôi phục.
+    \item \texttt{*\_reconstructed.docx}: File Word (.docx) chứa văn bản, bảng biểu và hình ảnh.
+\end{itemize}
+
+\section{Đánh giá hệ thống (Evaluation)}
+
+\subsection{Ưu điểm}
+\begin{itemize}
+    \item \textbf{Hiệu suất Detection \& OCR tốt:} Việc tái sử dụng các trọng số pretrained (DetrForSegmentation, TableTransformer) từ Hugging Face kết hợp cùng PaddleOCR giúp hệ thống đạt hiệu suất SOTA. Các bước phát hiện vùng (Region Detection), phân tách ô bảng (Cell Extraction) và trích xuất chữ (OCR) đều hoạt động rất trơn tru và nhận diện chính xác nội dung trên bản vẽ.
+    \item \textbf{Tối ưu thời gian:} Cách tiếp cận Inference Pipeline giúp tiết kiệm hàng trăm giờ huấn luyện (training) từ đầu.
+\end{itemize}
+
+\subsection{Hạn chế}
+Qua nhiều lần thử nghiệm thực tế, module \textbf{Document Generation (Xuất DOCX)} đang là nút thắt lớn nhất của hệ thống:
+\begin{itemize}
+    \item \textbf{Lỗi vỡ Layout trên Word:} Mặc dù file \texttt{.docx} xuất ra chứa đầy đủ tất cả các thành phần (hình ảnh gốc, các bảng biểu, ghi chú), nhưng chúng bị \textbf{lộn xộn và không giữ được bố cục không gian (spatial layout) của ảnh gốc}.
+    \item \textbf{Nguyên nhân:} Việc ép Microsoft Word tuân thủ tuyệt đối tọa độ Absolute Positioning qua XML (\texttt{w:tblpPr}) gặp nhiều rào cản do cơ chế tính toán lại layout tự động (auto-reflow) của Word, cộng với sai số khi quy đổi từ đơn vị Pixel sang Twips.
+    \item \textbf{Đồ họa CAD chưa được vector hóa:} Hiện tại hệ thống vẫn dựa vào ảnh nền (Background Image), chưa bóc tách và vector hóa hoàn toàn các đường nét cơ khí, dẫn đến trải nghiệm chỉnh sửa chưa đạt mức hoàn hảo nhất.
+\end{itemize}
+
+\section{Kết luận (Conclusion)}
+Dự án đã thành công một nửa chặng đường trong việc xây dựng hệ thống tự động hóa quy trình số hóa bản vẽ kỹ thuật. Pipeline trí tuệ nhân tạo (Detection \& OCR) hoạt động xuất sắc và xuất ra dữ liệu JSON có cấu trúc cực kỳ chính xác. Tuy nhiên, khâu kết xuất tài liệu (Rendering sang định dạng .docx) vẫn cần được nghiên cứu và tinh chỉnh sâu hơn để khắc phục hiện tượng vỡ layout, từ đó mới có thể hoàn thiện giải pháp chuyển đổi số toàn diện cho ngành cơ khí.
+\end{document}

@@ -12,12 +12,14 @@ import pandas as pd
 # ================== CẤU HÌNH ==================
 st.set_page_config(page_title="OCR Viewer - Engineering Drawings", page_icon="📄", layout="wide")
 
-BASE_DIR = Path(r"C:\Users\vanho\PycharmProjects\pythonProject2\Engineering Drawings")
+# Project root = thư mục cha của app/
+BASE_DIR = Path(__file__).resolve().parent.parent
 OUTPUTS_DIR = BASE_DIR / "outputs"
 VISUALIZE_DIR = OUTPUTS_DIR / "visualize"
 JSON_PATH = OUTPUTS_DIR / "ocr_results" / "web_demo_results.json"
 UPLOAD_IMAGES_DIR = BASE_DIR / "uploaded_images"
 MAIN_PY_PATH = BASE_DIR / "main.py"
+
 
 # Tạo thư mục
 for dir_path in [OUTPUTS_DIR, VISUALIZE_DIR, UPLOAD_IMAGES_DIR, OUTPUTS_DIR / "ocr_results"]:
@@ -30,6 +32,10 @@ if 'uploaded_images' not in st.session_state:
     st.session_state.uploaded_images = {}
 if 'processing' not in st.session_state:
     st.session_state.processing = False
+if 'last_stdout' not in st.session_state:
+    st.session_state.last_stdout = None
+if 'last_stderr' not in st.session_state:
+    st.session_state.last_stderr = None
 
 # ====================== HÀM ======================
 @st.cache_data(ttl=5)
@@ -66,13 +72,7 @@ def run_ocr_pipeline():
             check=False
         )
 
-        if result.stdout.strip():
-            with st.expander("📋 Output từ main.py"):
-                st.code(result.stdout)
-        if result.stderr.strip():
-            with st.expander("⚠️ Lỗi từ main.py"):
-                st.code(result.stderr, language="bash")
-
+        # Không dùng st.expander ở đây vì nó sẽ biến mất sau st.rerun()
         return result.returncode == 0, result.stdout, result.stderr
 
     except Exception as e:
@@ -227,25 +227,40 @@ def main():
         # Xử lý OCR (sau rerun)
         if st.session_state.processing:
             with st.spinner("🔄 Đang xử lý OCR... Có thể mất vài phút"):
-                success, _, stderr = run_ocr_pipeline()
+                success, stdout, stderr = run_ocr_pipeline()
+                
+                st.session_state.last_success = success
+                st.session_state.last_stdout = stdout
+                st.session_state.last_stderr = stderr
 
                 if success:
-                    st.success("✅ Xử lý OCR thành công!")
                     # Xóa ảnh đã upload sau khi xử lý
                     for f in list(UPLOAD_IMAGES_DIR.iterdir()):
                         if f.is_file():
                             f.unlink()
                     st.session_state.uploaded_images.clear()
-                else:
-                    st.error("❌ Xử lý thất bại!")
-                    if stderr:
-                        st.code(stderr, language="bash")
 
                 st.cache_data.clear()
                 st.session_state.json_data = load_json_data()
                 st.session_state.processing = False
-                time.sleep(1)
                 st.rerun()
+
+        # Hiển thị kết quả / Lỗi sau khi xử lý xong
+        if st.session_state.get('last_success') is False:
+            st.error("❌ Xử lý thất bại! Xem log bên dưới:")
+            with st.expander("⚠️ Chi tiết lỗi (Log)", expanded=True):
+                st.code(st.session_state.last_stderr, language="bash")
+                
+            if st.button("🗑️ Xóa log lỗi"):
+                st.session_state.last_success = None
+                st.session_state.last_stderr = None
+                st.rerun()
+        elif st.session_state.get('last_success') is True:
+            st.success("✅ Xử lý OCR thành công!")
+            # Có thể hiển thị thêm log nếu cần
+            if st.session_state.last_stderr:
+                with st.expander("📋 Log từ quá trình xử lý (Progress bars)"):
+                    st.code(st.session_state.last_stderr, language="bash")
 
         st.markdown("---")
 
@@ -303,6 +318,7 @@ def main():
                     bbox_str = ', '.join(map(str, bbox)) if bbox else 'N/A'
                     objects.append({
                         'STT': i+1,
+                        'Kiểu': '🖼️ Ảnh' if item.get('type') == 'image' else '📝 Chữ',
                         'Loại': item.get('class', 'Unknown'),
                         'Text': item.get('text', '')[:60],
                         'Confidence': round(item.get('confidence', 0), 3),

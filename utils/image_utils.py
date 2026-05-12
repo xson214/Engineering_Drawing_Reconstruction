@@ -11,7 +11,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from typing import List
 from config.config import (
     CROP_DIR, IMAGE_SIZE, IMAGE_MEAN,
-    IMAGE_STD, RESCALE_FACTOR
+    IMAGE_STD, RESCALE_FACTOR, DO_NORMALIZE, DO_RESCALE
 )
 
 
@@ -197,6 +197,11 @@ def save_cropped_regions_model2(image, detections, output_dir: Path, prefix: str
         output_dir.mkdir(parents=True, exist_ok=True)
 
         for i, det in enumerate(detections):
+            # Chỉ crop các box là cell hoặc spanning cell, bỏ qua row, column, table
+            class_name = det.get('class_name', '')
+            if class_name not in ['table cell', 'table spanning cell']:
+                continue
+                
             # Giả sử detections của model2 trả về dict có 'bbox' hoặc tương tự model1
             bbox = det.get('bbox')
             if not bbox or len(bbox) < 4:
@@ -213,6 +218,7 @@ def save_cropped_regions_model2(image, detections, output_dir: Path, prefix: str
 
             cells_metadata.append({
                 "cell_index": i,
+                "class_name": class_name,
                 "bbox": [x1, y1, x2, y2],
                 "cropped_image_path": str(crop_path)
             })

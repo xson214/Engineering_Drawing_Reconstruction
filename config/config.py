@@ -7,7 +7,7 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 
-MODEL_PATH = Path(r"D:\model\Engineering Drawings")
+MODEL_PATH = BASE_DIR / "models" / "Engineering Drawings"
 
 
 PREPROCESSOR_CONFIG = MODEL_PATH / "preprocessor_config.json"

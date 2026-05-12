@@ -10,7 +10,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from src.detector.models import LayoutDetector,TableDetector
 from utils.image_utils import draw_bboxes, save_cropped_regions, get_image_info,save_cropped_regions_model2
 from utils.read_json import get_table_image_paths
-from config.config import OUTPUT_DIR
+from config.config import OUTPUT_DIR, BASE_DIR
 from  src.detector.ocr_result import process_all_jsons
 
 class InferencePipeline:
@@ -23,11 +23,14 @@ class InferencePipeline:
         Args:
             detector: LayoutDetector instance (nếu None sẽ tự tạo)
         """
-        self.detector =  LayoutDetector(model_path=r"D:\model\Engineering Drawings",
-        threshold=0.7,
-        verbose=True)
-        self.detector2 =  TableDetector(model_path=r"D:\model\transdetect",
-        threshold=0.4,
+        self.detector = LayoutDetector(
+            model_path=str(BASE_DIR / "models" / "Engineering Drawings"),
+            threshold=0.7,
+            verbose=True
+        )
+        self.detector2 = TableDetector(
+            model_path=str(BASE_DIR / "models" / "transdetect"),
+            threshold=0.4,
         )
 
 
@@ -120,7 +123,7 @@ class InferencePipeline:
         cropped_paths_model2 = []
 
         if save_crops:
-            folder_path = r"C:\Users\vanho\PycharmProjects\pythonProject2\Engineering Drawings\outputs"
+            folder_path = str(OUTPUT_DIR)
             image_paths = get_table_image_paths(folder_path)
 
             if image_paths:
@@ -143,6 +146,33 @@ class InferencePipeline:
                             print(f"   [Model 2] Processing Table {i}/{len(image_paths)}: {Path(img_path).name}")
 
                         detections2 = self.detector2.detect(pil_image)
+                        
+                        # --- THUẬT TOÁN GIAO CẮT HÀNG VÀ CỘT (INTERSECTION) ---
+                        # Tách các Hàng và Cột
+                        rows = [d for d in detections2 if d['class_name'] == 'table row']
+                        cols = [d for d in detections2 if d['class_name'] == 'table column']
+                        
+                        cells = []
+                        for row in rows:
+                            for col in cols:
+                                # Tính phần giao nhau (Intersection)
+                                x1 = max(row['bbox'][0], col['bbox'][0])
+                                y1 = max(row['bbox'][1], col['bbox'][1])
+                                x2 = min(row['bbox'][2], col['bbox'][2])
+                                y2 = min(row['bbox'][3], col['bbox'][3])
+                                
+                                # Nếu có diện tích giao nhau hợp lệ
+                                if x2 > x1 and y2 > y1:
+                                    cells.append({
+                                        "class_name": "table cell",
+                                        "confidence": min(row['confidence'], col['confidence']),
+                                        "bbox": [x1, y1, x2, y2]
+                                    })
+                        
+                        # Bổ sung các ô đã giao cắt vào mảng detections
+                        detections2.extend(cells)
+                        # --------------------------------------------------------
+                        
                         detections2_list.append({
                             "image_path": img_path,
                             "detections": detections2
