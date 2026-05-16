@@ -190,29 +190,55 @@ def get_image_info(image):
             "mode": "RGB",
             "size": (w, h)
         }
+CELL_CROP_PADDING = 4
+MIN_CELL_SIZE = 5
+
+
 def save_cropped_regions_model2(image, detections, output_dir: Path, prefix: str) -> List[Path]:
-        """Lưu crop cho Model 2 vào folder riêng"""
+        """Lưu crop cho Model 2 và xuất metadata bảng (rows/cols/cells) ra JSON."""
         cropped_paths = []
         cells_metadata = []
+        rows_metadata = []
+        cols_metadata = []
         output_dir.mkdir(parents=True, exist_ok=True)
+        h_img, w_img = image.shape[:2]
 
+        # Pass 1: thu metadata row/col (chỉ cần bbox để engine dựng cấu trúc bảng,
+        # không cần crop ảnh row/col).
+        for det in detections:
+            cls = det.get('class_name', '')
+            bbox = det.get('bbox')
+            if not bbox or len(bbox) < 4:
+                continue
+            entry = {
+                "bbox": [int(b) for b in bbox],
+                "confidence": float(det.get('confidence', 0)),
+            }
+            if cls == 'table row':
+                rows_metadata.append(entry)
+            elif cls == 'table column':
+                cols_metadata.append(entry)
+
+        # Pass 2: crop cells với padding để OCR không bị mất nét chữ sát mép.
         for i, det in enumerate(detections):
-            # Chỉ crop các box là cell hoặc spanning cell, bỏ qua row, column, table
             class_name = det.get('class_name', '')
             if class_name not in ['table cell', 'table spanning cell']:
                 continue
-                
-            # Giả sử detections của model2 trả về dict có 'bbox' hoặc tương tự model1
             bbox = det.get('bbox')
             if not bbox or len(bbox) < 4:
                 continue
 
             x1, y1, x2, y2 = map(int, bbox)
-            cropped = image[y1:y2, x1:x2]  # OpenCV crop
+            x1 = max(0, x1 - CELL_CROP_PADDING)
+            y1 = max(0, y1 - CELL_CROP_PADDING)
+            x2 = min(w_img, x2 + CELL_CROP_PADDING)
+            y2 = min(h_img, y2 + CELL_CROP_PADDING)
+            if x2 - x1 < MIN_CELL_SIZE or y2 - y1 < MIN_CELL_SIZE:
+                continue
 
+            cropped = image[y1:y2, x1:x2]
             crop_name = f"{prefix}_model2_crop_{i + 1:03d}.jpg"
             crop_path = output_dir / crop_name
-
             cv2.imwrite(str(crop_path), cropped)
             cropped_paths.append(crop_path)
 
@@ -220,14 +246,17 @@ def save_cropped_regions_model2(image, detections, output_dir: Path, prefix: str
                 "cell_index": i,
                 "class_name": class_name,
                 "bbox": [x1, y1, x2, y2],
-                "cropped_image_path": str(crop_path)
+                "cropped_image_path": str(crop_path),
             })
 
-            # Lưu tất cả metadata vào file JSON
-            json_path = output_dir / f"{prefix}_metadata.json"
-            with open(json_path, 'w', encoding='utf-8') as f:
-                json.dump(cells_metadata, f, ensure_ascii=False, indent=2)
-
-            print(f"   📁 Đã lưu metadata vào: {json_path}")
+        metadata = {
+            "rows": rows_metadata,
+            "cols": cols_metadata,
+            "cells": cells_metadata,
+        }
+        json_path = output_dir / f"{prefix}_metadata.json"
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        print(f"   📁 Đã lưu metadata vào: {json_path}")
 
         return cropped_paths

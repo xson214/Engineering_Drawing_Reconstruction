@@ -21,24 +21,34 @@ class DocumentReconstructor:
         # hoặc [[{"cropped_image_path": "..."}]]
         model2_grouped = {}
         for item in final_result.get("model2_results", []):
-            cells = item.get("cells", []) if isinstance(item, dict) else item
+            if isinstance(item, dict):
+                cells = item.get("cells", [])
+                rows_meta = item.get("rows", [])
+                cols_meta = item.get("cols", [])
+            else:
+                cells = item
+                rows_meta, cols_meta = [], []
             if not cells:
                 continue
-            
+
             # Lấy path của cell đầu tiên để trích xuất thông tin
             crop_path = Path(cells[0].get("cropped_image_path", ""))
             if not crop_path.name:
                 continue
-            
+
             # Extract image_name and table_id. Pattern: {image_name}_table_{i}_...
             match = re.match(r"(.*)_table_(\d+)_model2_crop", crop_path.name)
             if match:
                 img_stem = match.group(1)
                 table_idx = int(match.group(2))
-                
+
                 if img_stem not in model2_grouped:
                     model2_grouped[img_stem] = {}
-                model2_grouped[img_stem][table_idx] = cells
+                model2_grouped[img_stem][table_idx] = {
+                    "cells": cells,
+                    "rows": rows_meta,
+                    "cols": cols_meta,
+                }
 
         reconstructed_docs = []
         for img_data in final_result.get("model1_results", []):
@@ -98,11 +108,15 @@ class DocumentReconstructor:
         
         for i, table_obj in enumerate(tables_raw):
             table_idx = i + 1
-            cells = tables_cells_dict.get(table_idx, [])
-            
+            table_data = tables_cells_dict.get(table_idx,
+                                               {"cells": [], "rows": [], "cols": []})
+            # Tương thích format cũ (chỉ là list cells).
+            if isinstance(table_data, list):
+                table_data = {"cells": table_data, "rows": [], "cols": []}
+
             bbox = table_obj.get('bbox', {'x1': 0, 'y1': 0, 'x2': 0, 'y2': 0})
-            
-            structure = self._reconstruct_table_grid(cells, bbox)
+
+            structure = self._reconstruct_table_grid(table_data, bbox)
             
             norm_bbox = [
                 bbox['x1'] / width, bbox['y1'] / height,
@@ -204,125 +218,220 @@ class DocumentReconstructor:
         
         return doc_struct
 
-    def _reconstruct_table_grid(self, cells, table_bbox):
+    def _reconstruct_table_grid(self, table_data, table_bbox):
+        """Dựng cấu trúc lưới bảng từ metadata Model 2.
+
+        Nếu có row/col bbox từ TableDetector → dùng trực tiếp (chính xác cả
+        khi có cột rỗng hoặc cell rỗng). Ngược lại fallback về clustering
+        x_center theo cell có chữ như logic cũ.
+        """
+        if isinstance(table_data, dict):
+            cells = table_data.get('cells', [])
+            rows_meta = table_data.get('rows', [])
+            cols_meta = table_data.get('cols', [])
+        else:
+            cells = table_data
+            rows_meta, cols_meta = [], []
+
         if not cells:
             return {"columns": 0, "rows": [], "col_widths": [], "row_heights": []}
-            
+
+        if rows_meta and cols_meta:
+            return self._build_grid_from_lines(cells, rows_meta, cols_meta)
+        return self._build_grid_from_cells(cells, table_bbox)
+
+    def _build_grid_from_lines(self, cells, rows_meta, cols_meta):
+        """Dựng lưới bảng dựa trực tiếp vào bbox row/col của detector.
+
+        Đây là path chính: số cột/độ rộng cột phản ánh đúng cấu trúc bảng gốc
+        kể cả khi có cột rỗng (vd. cột GRADE) hoặc cell rỗng.
+        """
+        rows_sorted = sorted(self._merge_lines(rows_meta, axis='y', tol=8),
+                             key=lambda r: r['bbox'][1])
+        cols_sorted = sorted(self._merge_lines(cols_meta, axis='x', tol=8),
+                             key=lambda c: c['bbox'][0])
+
+        num_rows = len(rows_sorted)
+        num_cols = len(cols_sorted)
+        if num_rows == 0 or num_cols == 0:
+            return {"columns": 0, "rows": [], "col_widths": [], "row_heights": []}
+
+        col_widths = [max(1, c['bbox'][2] - c['bbox'][0]) for c in cols_sorted]
+        row_heights = [max(1, r['bbox'][3] - r['bbox'][1]) for r in rows_sorted]
+
+        row_ranges = [(r['bbox'][1], r['bbox'][3]) for r in rows_sorted]
+        col_ranges = [(c['bbox'][0], c['bbox'][2]) for c in cols_sorted]
+
+        grid = [["" for _ in range(num_cols)] for _ in range(num_rows)]
+        for cell in cells:
+            bbox = cell.get('bbox') or []
+            if len(bbox) < 4:
+                continue
+            text = (cell.get('ocr_text') or '').strip()
+            if not text:
+                continue
+            cx = (bbox[0] + bbox[2]) / 2
+            cy = (bbox[1] + bbox[3]) / 2
+            row_idx = self._best_index(cy, row_ranges)
+            col_idx = self._best_index(cx, col_ranges)
+            if row_idx is None or col_idx is None:
+                continue
+            existing = grid[row_idx][col_idx]
+            grid[row_idx][col_idx] = (existing + ' ' + text).strip() if existing else text
+
+        return {
+            "columns": num_cols,
+            "rows": grid,
+            "col_widths": col_widths,
+            "row_heights": row_heights,
+        }
+
+    @staticmethod
+    def _merge_lines(lines, axis='y', tol=8):
+        """Gộp các bbox row/col gần trùng (tránh sinh hàng/cột dư)."""
+        if not lines:
+            return []
+        key_lo = 1 if axis == 'y' else 0
+        key_hi = 3 if axis == 'y' else 2
+        sorted_lines = sorted(lines, key=lambda d: d['bbox'][key_lo])
+        merged = []
+        for ln in sorted_lines:
+            bbox = list(ln['bbox'])
+            conf = float(ln.get('confidence', 0))
+            if merged and abs(bbox[key_lo] - merged[-1]['bbox'][key_lo]) <= tol:
+                last = merged[-1]
+                last['bbox'][key_lo] = min(last['bbox'][key_lo], bbox[key_lo])
+                last['bbox'][key_hi] = max(last['bbox'][key_hi], bbox[key_hi])
+                last['confidence'] = max(last['confidence'], conf)
+                continue
+            merged.append({"bbox": bbox, "confidence": conf})
+        return merged
+
+    @staticmethod
+    def _best_index(value, ranges):
+        """Tìm chỉ số range chứa `value`; nếu không có thì chọn range gần nhất."""
+        if not ranges:
+            return None
+        for i, (lo, hi) in enumerate(ranges):
+            if lo <= value <= hi:
+                return i
+        best_idx = 0
+        best_dist = float('inf')
+        for i, (lo, hi) in enumerate(ranges):
+            center = (lo + hi) / 2
+            dist = abs(value - center)
+            if dist < best_dist:
+                best_dist = dist
+                best_idx = i
+        return best_idx
+
+    def _build_grid_from_cells(self, cells, table_bbox):
+        """Fallback: dựng lưới bằng clustering x_center của cell có chữ.
+
+        Logic cũ — chỉ dùng khi không có metadata row/col của detector.
+        """
         valid_cells = [c for c in cells if 'bbox' in c and len(c['bbox']) == 4]
         if not valid_cells:
             return {"columns": 0, "rows": [], "col_widths": [], "row_heights": []}
-            
-        # Gom hàng (Rows): Nhóm các cell có y overlap
+
         valid_cells.sort(key=lambda c: c['bbox'][1])
-        
+
         rows = []
         current_row = [valid_cells[0]]
-        
         for cell in valid_cells[1:]:
             cy = (cell['bbox'][1] + cell['bbox'][3]) / 2
             row_ymin = min(c['bbox'][1] for c in current_row)
             row_ymax = max(c['bbox'][3] for c in current_row)
-            
             if row_ymin <= cy <= row_ymax:
                 current_row.append(cell)
             else:
                 rows.append(current_row)
                 current_row = [cell]
-                
         if current_row:
             rows.append(current_row)
-            
-        # Row heights
+
         row_y_min = [min(c['bbox'][1] for c in r) for r in rows]
         row_y_max = [max(c['bbox'][3] for c in r) for r in rows]
-        
+
         row_boundaries = [table_bbox.get('y1', 0)]
         for i in range(len(rows) - 1):
-            boundary = (row_y_max[i] + row_y_min[i+1]) / 2
+            boundary = (row_y_max[i] + row_y_min[i + 1]) / 2
             row_boundaries.append(boundary)
         row_boundaries.append(table_bbox.get('y2', 0))
-        
-        row_heights = [max(0, row_boundaries[i+1] - row_boundaries[i]) for i in range(len(rows))]
-            
-        # Xác định cột (Columns)
+
+        row_heights = [max(0, row_boundaries[i + 1] - row_boundaries[i])
+                       for i in range(len(rows))]
+
         x_centers = []
         for r in rows:
             for c in r:
                 x_centers.append((c['bbox'][0] + c['bbox'][2]) / 2)
-                
         x_centers.sort()
         columns_x = []
         if x_centers:
             thresh = 20
             curr_col = [x_centers[0]]
             for xc in x_centers[1:]:
-                if xc - sum(curr_col)/len(curr_col) < thresh:
+                if xc - sum(curr_col) / len(curr_col) < thresh:
                     curr_col.append(xc)
                 else:
-                    columns_x.append(sum(curr_col)/len(curr_col))
+                    columns_x.append(sum(curr_col) / len(curr_col))
                     curr_col = [xc]
             if curr_col:
-                columns_x.append(sum(curr_col)/len(curr_col))
-                
+                columns_x.append(sum(curr_col) / len(curr_col))
+
         num_cols = len(columns_x)
-        
-        # Col widths
         col_x_min = [float('inf')] * num_cols
         col_x_max = [0] * num_cols
         for row in rows:
             for cell in row:
                 cx = (cell['bbox'][0] + cell['bbox'][2]) / 2
-                col_idx = 0
-                min_dist = float('inf')
-                for i, col_x in enumerate(columns_x):
-                    dist = abs(cx - col_x)
-                    if dist < min_dist:
-                        min_dist = dist
-                        col_idx = i
+                col_idx = min(range(num_cols), key=lambda i: abs(cx - columns_x[i]))
                 col_x_min[col_idx] = min(col_x_min[col_idx], cell['bbox'][0])
                 col_x_max[col_idx] = max(col_x_max[col_idx], cell['bbox'][2])
-                
+
         for i in range(num_cols):
             if col_x_min[i] == float('inf'):
                 col_x_min[i] = columns_x[i] - 10
                 col_x_max[i] = columns_x[i] + 10
-                
+
         col_boundaries = [table_bbox.get('x1', 0)]
         for i in range(num_cols - 1):
-            boundary = (col_x_max[i] + col_x_min[i+1]) / 2
+            boundary = (col_x_max[i] + col_x_min[i + 1]) / 2
             col_boundaries.append(boundary)
         col_boundaries.append(table_bbox.get('x2', 0))
-        
-        col_widths = [max(0, col_boundaries[i+1] - col_boundaries[i]) for i in range(num_cols)]
-        
+        col_widths = [max(0, col_boundaries[i + 1] - col_boundaries[i])
+                      for i in range(num_cols)]
+
         grid = []
         for row in rows:
             row_texts = [""] * num_cols
             for cell in row:
                 cx = (cell['bbox'][0] + cell['bbox'][2]) / 2
-                col_idx = 0
-                min_dist = float('inf')
-                for i, col_x in enumerate(columns_x):
-                    dist = abs(cx - col_x)
-                    if dist < min_dist:
-                        min_dist = dist
-                        col_idx = i
-                
+                col_idx = min(range(num_cols), key=lambda i: abs(cx - columns_x[i]))
                 if row_texts[col_idx]:
                     row_texts[col_idx] += " " + cell.get('ocr_text', '')
                 else:
                     row_texts[col_idx] = cell.get('ocr_text', '')
-                    
             grid.append([t.strip() for t in row_texts])
-            
+
         return {
             "columns": num_cols,
             "rows": grid,
             "col_widths": col_widths,
-            "row_heights": row_heights
+            "row_heights": row_heights,
         }
 
-    def _lock_table_layout(self, table, left_inch, top_inch, width_inch, height_inch=None):
+    def _lock_table_layout(self, table, left_inch, top_inch, width_inch,
+                           height_inch=None, height_rule='exact'):
+        """Khóa vị trí/kích thước bảng nổi.
+
+        height_rule:
+            - 'exact'   : khóa cứng chiều cao bằng `height_inch` (Word cắt nội dung vượt).
+            - 'atLeast' : dùng `height_inch` làm chiều cao tối thiểu, cho phép bảng
+                          tự nở thêm khi nội dung vượt (phù hợp cho khối Notes vì OCR
+                          có thể bể dòng nhiều hơn so với layout gốc).
+        """
         from docx.oxml import OxmlElement
         from docx.oxml.ns import qn
         from docx.shared import Inches
@@ -365,14 +474,15 @@ class DocumentReconstructor:
         tblW.set(qn('w:type'), 'dxa')
         tblPr.append(tblW)
         
-        # Ép chiều cao (nếu được truyền vào - đặc biệt hữu ích cho Notes và Drawing)
+        # Ép chiều cao (nếu được truyền vào). Với 'atLeast' bảng có thể nở thêm
+        # khi nội dung dài hơn vùng layout phát hiện được.
         if height_inch is not None:
             for row in table.rows:
                 row.height = Inches(height_inch)
                 trPr = row._tr.get_or_add_trPr()
                 trHeight = OxmlElement('w:trHeight')
                 trHeight.set(qn('w:val'), str(int(height_inch * 1440)))
-                trHeight.set(qn('w:hRule'), 'exact')
+                trHeight.set(qn('w:hRule'), height_rule)
                 trPr.append(trHeight)
 
     def _export_to_docx(self, doc_struct):
@@ -481,42 +591,55 @@ class DocumentReconstructor:
                                     run.font.name = 'Times New Roman'
                                     
             elif etype in ["notes", "metadata"]:
-                items = element.get("items", []) if etype == "notes" else [element.get("text", "")]
-                if not any(items):
+                raw_items = element.get("items", []) if etype == "notes" else [element.get("text", "")]
+                items = [it for it in raw_items if it and it.strip()]
+                if not items:
                     continue
-                    
-                # Dùng bảng 1x1 không viền làm TextBox
+
+                # Notes cần nhiều chỗ hơn vì OCR thường bể dòng khác với layout gốc.
+                # Nới rộng padding ngang + dùng atLeast để bảng tự cao thêm nếu cần
+                # → tránh tình trạng text bị cắt cụt như khi dùng hRule='exact'.
+                note_pad = 12
+                nx1 = max(0, bbox[0] - note_pad)
+                ny1 = max(0, bbox[1] - note_pad)
+                nw = bbox[2] - bbox[0] + note_pad * 2
+                nh = bbox[3] - bbox[1] + note_pad * 2
+                n_left = nx1 / scale
+                n_top = ny1 / scale
+                n_width = nw / scale
+                n_height = nh / scale
+
                 table = doc.add_table(rows=1, cols=1)
-                
-                # Ép tọa độ tuyệt đối và khóa cứng Layout bằng Helper
-                self._lock_table_layout(table, left_inch, top_inch, width_inch, height_inch)
-                
+                self._lock_table_layout(table, n_left, n_top, n_width, n_height,
+                                        height_rule='atLeast')
+
                 tblPr = table._element.tblPr
-                # Bỏ viền
                 tblBorders = OxmlElement('w:tblBorders')
                 for b_name in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
                     border = OxmlElement(f'w:{b_name}')
                     border.set(qn('w:val'), 'none')
                     tblBorders.append(border)
                 tblPr.append(tblBorders)
-                
+
                 cell = table.cell(0, 0)
                 shading_elm = parse_xml(r'<w:shd {} w:fill="FFFFFF"/>'.format(nsdecls('w')))
                 cell._tc.get_or_add_tcPr().append(shading_elm)
-                
+
                 cell.text = ""
+                first_para = cell.paragraphs[0]
                 for idx, item in enumerate(items):
-                    if item.strip():
-                        p = cell.add_paragraph(item) if idx > 0 else cell.paragraphs[0]
-                        if idx == 0:
-                            p.text = item
-                        p.paragraph_format.space_after = Pt(2)
-                        for run in p.runs:
-                            run.font.size = Pt(9)
-                            run.font.name = 'Times New Roman'
-                            if etype == "metadata":
-                                run.font.color.rgb = RGBColor(100, 100, 100)
-                                run.font.italic = True
+                    if idx == 0:
+                        p = first_para
+                        p.text = item
+                    else:
+                        p = cell.add_paragraph(item)
+                    p.paragraph_format.space_after = Pt(2)
+                    for run in p.runs:
+                        run.font.size = Pt(8)
+                        run.font.name = 'Times New Roman'
+                        if etype == "metadata":
+                            run.font.color.rgb = RGBColor(100, 100, 100)
+                            run.font.italic = True
                                 
             elif etype == "drawing":
                 img_path = element.get("image_path")

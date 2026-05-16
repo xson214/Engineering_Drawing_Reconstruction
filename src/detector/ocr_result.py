@@ -1,4 +1,5 @@
 import json
+import re
 from pathlib import Path
 from paddleocr import PaddleOCR
 from PIL import Image
@@ -24,36 +25,79 @@ ocr_en = PaddleOCR(
     lang='en',
 )
 
+# Chiều cao tối thiểu để PaddleOCR recognizer nhìn rõ chữ.
+# Cell bảng kỹ thuật thường rất nhỏ; nếu không upscale dễ mất ký tự.
+MIN_OCR_HEIGHT = 48
+
+# Regex bắt ký tự alpha-numeric + chữ tiếng Việt có dấu, dùng để
+# đếm số ký tự "có nghĩa" khi cho điểm kết quả OCR.
+_ALNUM_VN_RE = re.compile(r"[\w\u00C0-\u1EF9]")
+
+
+def _preprocess_for_ocr(image_path):
+    """Đọc ảnh cell, upscale nếu quá nhỏ và khử nhiễu nhẹ trước khi OCR.
+
+    Trả về numpy BGR để PaddleOCR có thể nhận trực tiếp.
+    """
+    img = cv2.imread(str(image_path))
+    if img is None:
+        return None
+
+    h, w = img.shape[:2]
+    if h > 0 and h < MIN_OCR_HEIGHT:
+        scale = MIN_OCR_HEIGHT / float(h)
+        new_w = max(1, int(round(w * scale)))
+        img = cv2.resize(img, (new_w, MIN_OCR_HEIGHT), interpolation=cv2.INTER_CUBIC)
+
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.bilateralFilter(gray, 5, 50, 50)
+    return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+
+def _score_lines(lines):
+    """Cho điểm tập kết quả OCR dựa trên độ tự tin trung bình và số ký tự thật.
+
+    Việc kết hợp mean_conf với sqrt(char_count) giúp:
+    - Không bị thiên vị model trả ra nhiều cụm nhiễu nhỏ (như khi dùng sum).
+    - Vẫn ưu tiên model đọc được nhiều ký tự ý nghĩa.
+    """
+    if not lines:
+        return 0.0
+    confs = [c for _, _, c in lines]
+    mean_conf = sum(confs) / len(confs)
+    char_count = sum(len(_ALNUM_VN_RE.findall(t)) for _, t, _ in lines)
+    return mean_conf * (char_count ** 0.5)
+
+
+def _collect_lines(result):
+    """Chuẩn hoá output PaddleOCR thành list (y_center, text, conf)."""
+    lines = []
+    if not result or not result[0]:
+        return lines
+    for line in result[0]:
+        text = line[1][0]
+        conf = line[1][1]
+        y_center = (line[0][0][1] + line[0][2][1]) / 2
+        lines.append((y_center, text, conf))
+    return lines
+
 
 def ocr_cell(image_path):
     """OCR cho một ảnh cell, trả về toàn bộ text (nối các dòng) và confidence trung bình"""
     try:
-        result_vi = ocr_vi.ocr(str(image_path))
-        result_en = ocr_en.ocr(str(image_path))
+        prepared = _preprocess_for_ocr(image_path)
+        ocr_input = prepared if prepared is not None else str(image_path)
 
-        # Thu thập tất cả các dòng từ mỗi model
-        lines_vi = []
-        if result_vi and result_vi[0]:
-            for line in result_vi[0]:
-                text = line[1][0]
-                conf = line[1][1]
-                # Lấy tọa độ y trung bình để sắp xếp theo thứ tự dòng
-                y_center = (line[0][0][1] + line[0][2][1]) / 2
-                lines_vi.append((y_center, text, conf))
+        result_vi = ocr_vi.ocr(ocr_input)
+        result_en = ocr_en.ocr(ocr_input)
 
-        lines_en = []
-        if result_en and result_en[0]:
-            for line in result_en[0]:
-                text = line[1][0]
-                conf = line[1][1]
-                y_center = (line[0][0][1] + line[0][2][1]) / 2
-                lines_en.append((y_center, text, conf))
+        lines_vi = _collect_lines(result_vi)
+        lines_en = _collect_lines(result_en)
 
-        # Chọn model nào có tổng confidence cao hơn
-        total_conf_vi = sum(c for _, _, c in lines_vi) if lines_vi else 0
-        total_conf_en = sum(c for _, _, c in lines_en) if lines_en else 0
-
-        chosen_lines = lines_vi if total_conf_vi >= total_conf_en else lines_en
+        # Chọn model nào có điểm tổng hợp cao hơn (mean_conf * sqrt(char_count)).
+        score_vi = _score_lines(lines_vi)
+        score_en = _score_lines(lines_en)
+        chosen_lines = lines_vi if score_vi >= score_en else lines_en
 
         if not chosen_lines:
             return "", 0
